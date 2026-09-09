@@ -36,7 +36,8 @@ def setup_logging(log_level: str = "INFO") -> None:
     try:
         import colorlog
         
-        handler = colorlog.ColoredHandler(
+        # Create formatter with color support
+        formatter = colorlog.ColoredFormatter(
             fmt='%(log_color)s[%(asctime)s] %(levelname)s:%(reset)s %(message)s',
             datefmt='%Y-%m-%d %H:%M:%S',
             log_colors={
@@ -47,6 +48,10 @@ def setup_logging(log_level: str = "INFO") -> None:
                 'CRITICAL': 'bold_red',
             }
         )
+        
+        handler = logging.StreamHandler()
+        handler.setFormatter(formatter)
+        
     except ImportError:
         handler = logging.StreamHandler()
         handler.setFormatter(logging.Formatter(

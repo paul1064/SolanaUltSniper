@@ -91,6 +91,8 @@ venv\Scripts\activate     # Windows
 pip install -r requirements.txt
 ```
 
+**Hinweis**: Das Paket `pynacl` (Python NaCl binding) wird für kryptographische Operationen benötigt und ersetzt das veraltete `nacl` Paket.
+
 ### 4. Umgebungsvariablen konfigurieren
 
 **WICHTIG**: Private Keys NIEMALS hardcoded speichern!
@@ -342,15 +344,56 @@ python main.py --dry-run true
 
 ## 🐛 Troubleshooting
 
+### Häufige Probleme und Lösungen
+
+**Problem**: `module 'colorlog' has no attribute 'ColoredHandler'`
+```bash
+# Ursache: Falsche API-Verwendung im Logging
+# Lösung: Wurde behoben! Der Bot verwendet jetzt ColoredFormatter statt ColoredHandler
+pip install -U colorlog
+python main.py  # Sollte jetzt funktionieren
+```
+
+**Problem**: `nacl>=1.5.0` Installation fehlgeschlagen
+```bash
+# Ursache: Das Paket 'nacl' ist veraltet
+# Lösung: requirements.txt wurde auf 'pynacl' aktualisiert
+pip install -r requirements.txt  # Funktioniert jetzt
+```
+
+**Problem**: "'str' object is not an instance of 'Pubkey'"
+```bash
+# Ursache: String Program IDs wurden nicht konvertiert
+# Lösung: PoolMonitor konvertiert jetzt automatisch Strings zu Pubkey Objekten
+# Der Bot startet ohne Fehler
+```
+
 **Problem**: "WALLET_PRIVATE_KEY must be set"
 ```bash
 export WALLET_PRIVATE_KEY="your_key"
+# Oder in .env Datei:
+# WALLET_PRIVATE_KEY=dein_key_hier
 ```
 
 **Problem**: "Transaction failed: Blockhash not found"
 ```bash
-# Priority Fee erhöhen
-PRIORITY_FEE_LAMPORTS=200000
+# Priority Fee erhöhen für schnellere Verarbeitung
+export PRIORITY_FEE_LAMPORTS=200000
+```
+
+**Problem**: WebSocket Verbindungsabbrüche
+```bash
+# Normalverhalten bei kostenlosem RPC - verwende Premium Provider
+export SOLANA_RPC_URL=https://your-endpoint.quiknode.pro/
+export SOLANA_WS_URL=wss://your-endpoint.quiknode.pro/
+```
+
+**Problem**: Zu viele fehlgeschlagene Transaktionen
+```bash
+# Slippage erhöhen (Vorsicht!)
+export MAX_SLIPPAGE_BPS=1000  # 10% statt 5%
+# Oder Priority Fee erhöhen
+export PRIORITY_FEE_LAMPORTS=500000
 ```
 
 ---

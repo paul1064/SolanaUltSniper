@@ -178,15 +178,20 @@ class PoolMonitor:
         Subscribe to logs for a DEX program.
         
         Args:
-            program_id: Program public key
+            program_id: Program public key (as string)
             dex_name: Name of the DEX
         """
+        from solders.pubkey import Pubkey
+        
         logger.info(f"Subscribing to {dex_name} program: {program_id}")
         
         try:
+            # Convert string to Pubkey object
+            program_pubkey = Pubkey.from_string(program_id)
+            
             # Subscribe to program logs
             subscription = await self._ws_connection.program_subscribe(
-                program_id,
+                program_pubkey,
                 commitment="confirmed",
             )
             
@@ -216,8 +221,13 @@ class PoolMonitor:
                 # Send ping to keep connection alive
                 continue
             except Exception as e:
-                logger.error(f"Error processing message: {str(e)}")
-                await asyncio.sleep(1.0)
+                error_msg = str(e)
+                # Ignore WebSocket close frame errors (normal behavior)
+                if "sent 1000" in error_msg and "received 1000" in error_msg:
+                    logger.debug(f"WebsSocket keepalive: {error_msg}")
+                else:
+                    logger.error(f"Error processing message: {error_msg}")
+                await asyncio.sleep(0.5)
     
     async def _process_log_message(self, message: Any) -> None:
         """
