@@ -1,0 +1,40 @@
+# Core Solana SDK dependencies (based on solana-py)
+solana>=0.35.0
+solders>=0.28.0
+
+# HTTP & WebSocket clients
+httpx>=0.27.0
+websockets>=12.0
+aiohttp>=3.9.0
+
+# Async support
+asyncio>=3.4.3
+aiolimiter>=1.1.0
+
+# Environment variables
+python-dotenv>=1.0.0
+
+# Data validation
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+
+# Logging
+colorlog>=6.8.0
+
+# Utilities
+base58>=2.1.0
+nacl>=1.5.0
+
+# Optional: Jito MEV protection
+# jito-searcher-client>=0.1.0
+
+# Optional: Advanced analytics
+# pandas>=2.0.0
+# numpy>=1.24.0
+
+# Development dependencies (optional)
+# pytest>=7.4.0
+# pytest-asyncio>=0.21.0
+# mypy>=1.7.0
+# black>=23.11.0
+# ruff>=0.1.0
