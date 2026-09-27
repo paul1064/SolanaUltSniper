@@ -165,8 +165,8 @@ class TokenFilter:
             return False
         
         # Check creator address
-        creator = pool_info.get("creator_address", "")
-        if creator in self.creator_blacklist:
+        creator = pool_info.get("creator_address")
+        if creator and creator in self.creator_blacklist:
             logger.warning(f"Blacklisted creator: {creator}")
             return False
         
@@ -174,7 +174,7 @@ class TokenFilter:
     
     def _check_liquidity(self, pool_info: Dict[str, Any]) -> bool:
         """Check if pool liquidity is within acceptable range."""
-        liquidity_sol = pool_info.get("liquidity_sol", 0)
+        liquidity_sol = pool_info.get("liquidity_sol") or 0
         
         if liquidity_sol < self.min_liquidity_sol:
             logger.debug(
@@ -192,7 +192,7 @@ class TokenFilter:
     
     def _get_liquidity_rejection_reason(self, pool_info: Dict[str, Any]) -> str:
         """Get detailed rejection reason for liquidity check."""
-        liquidity_sol = pool_info.get("liquidity_sol", 0)
+        liquidity_sol = pool_info.get("liquidity_sol") or 0
         
         if liquidity_sol < self.min_liquidity_sol:
             return (
@@ -209,7 +209,7 @@ class TokenFilter:
         """Check if pool age is within acceptable range."""
         import time
         
-        creation_time = pool_info.get("creation_timestamp", 0)
+        creation_time = pool_info.get("creation_timestamp") or 0
         current_time = time.time()
         
         if creation_time == 0:
@@ -243,7 +243,7 @@ class TokenFilter:
         - Name/symbol don't contain scam keywords
         - Token URI is valid (if available)
         """
-        metadata = pool_info.get("token_metadata", {})
+        metadata = pool_info.get("token_metadata") or {}
         
         name = metadata.get("name", "")
         symbol = metadata.get("symbol", "")

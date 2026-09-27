@@ -10,9 +10,9 @@ Implements comprehensive risk management including:
 """
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, Optional, Any
-from datetime import datetime, date
+from datetime import datetime, timezone
 import time
 
 logger = logging.getLogger(__name__)
@@ -115,7 +115,7 @@ class RiskManager:
         self.positions: Dict[str, Position] = {}
         
         # Daily statistics
-        self.today_stats = DailyStats(date=date.today().isoformat())
+        self.today_stats = DailyStats(date=self._today())
         
         # Cooldown tracking
         self.last_trade_time: float = 0.0
@@ -134,8 +134,10 @@ class RiskManager:
         Returns:
             Tuple of (can_open, reason)
         """
+        self._roll_daily_stats()
+        
         # Check daily loss limit
-        if self.today_stats.total_pnl_sol < -self.daily_loss_limit_sol:
+        if self.today_stats.total_pnl_sol <= -self.daily_loss_limit_sol:
             return False, "Daily loss limit reached"
         
         # Check position size
@@ -145,7 +147,7 @@ class RiskManager:
         # Check total exposure
         current_exposure = sum(p.amount_sol_invested for p in self.positions.values())
         if current_exposure + amount_sol > self.max_total_exposure_sol:
-            return False, f"Total exposure would exceed limit"
+            return False, "Total exposure would exceed limit"
         
         # Check cooldown
         time_since_last_trade = time.time() - self.last_trade_time
@@ -305,9 +307,14 @@ class RiskManager:
             return None
         
         # Calculate realized PnL
+        self._roll_daily_stats()
+        
         exit_value_sol = position.amount_tokens * exit_price
         pnl_sol = exit_value_sol - position.amount_sol_invested
-        pnl_percent = (pnl_sol / position.amount_sol_invested) * 100
+        pnl_percent = (
+            (pnl_sol / position.amount_sol_invested) * 100
+            if position.amount_sol_invested else 0.0
+        )
         
         # Update statistics
         self.total_pnl_sol += pnl_sol
@@ -359,7 +366,16 @@ class RiskManager:
             ),
         }
     
+    @staticmethod
+    def _today() -> str:
+        return datetime.now(timezone.utc).date().isoformat()
+    
+    def _roll_daily_stats(self) -> None:
+        """Start fresh daily statistics once the UTC date changes."""
+        if self.today_stats.date != self._today():
+            self.reset_daily_stats()
+    
     def reset_daily_stats(self) -> None:
-        """Reset daily statistics (call at midnight UTC)."""
-        self.today_stats = DailyStats(date=date.today().isoformat())
+        """Reset daily statistics (called automatically at midnight UTC)."""
+        self.today_stats = DailyStats(date=self._today())
         logger.info("Daily statistics reset")

@@ -91,8 +91,6 @@ venv\Scripts\activate     # Windows
 pip install -r requirements.txt
 ```
 
-**Hinweis**: Das Paket `pynacl` (Python NaCl binding) wird für kryptographische Operationen benötigt und ersetzt das veraltete `nacl` Paket.
-
 ### 4. Umgebungsvariablen konfigurieren
 
 **WICHTIG**: Private Keys NIEMALS hardcoded speichern!
@@ -356,8 +354,8 @@ python main.py  # Sollte jetzt funktionieren
 
 **Problem**: `nacl>=1.5.0` Installation fehlgeschlagen
 ```bash
-# Ursache: Das Paket 'nacl' ist veraltet
-# Lösung: requirements.txt wurde auf 'pynacl' aktualisiert
+# Ursache: Das Paket 'nacl' ist veraltet und wird nicht benötigt
+# Lösung: Signieren läuft über solders, die Abhängigkeit wurde entfernt
 pip install -r requirements.txt  # Funktioniert jetzt
 ```
 

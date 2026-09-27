@@ -181,7 +181,7 @@ class SecurityChecker:
             risk_flags=risk_flags,
             metadata={
                 "pool_info": pool_info,
-                "analysis_timestamp": pool_info.get("timestamp"),
+                "analysis_timestamp": pool_info.get("creation_timestamp"),
             }
         )
     
@@ -296,19 +296,21 @@ class SecurityChecker:
         risks = []
         
         # Check initial liquidity
-        initial_liq = pool_info.get("initial_liquidity_sol", 0)
+        initial_liq = pool_info.get("initial_liquidity_sol") or 0
         if initial_liq > 10000:
             risks.append("Unusually high initial liquidity")
         elif initial_liq < 100:
             risks.append("Very low initial liquidity - high volatility risk")
         
         # Check token metadata
-        name = token_info.get("name", "")
+        name = token_info.get("name") or ""
         if len(name) > 50:
             risks.append("Suspiciously long token name")
         
         # Check decimals
-        decimals = token_info.get("decimals", 9)
+        decimals = token_info.get("decimals")
+        if decimals is None:
+            decimals = 9
         if decimals < 6 or decimals > 18:
             risks.append(f"Unusual decimal count: {decimals}")
         
