@@ -8,9 +8,8 @@ Security Best Practice:
 - Use proper secrets management in production
 """
 
-import os
 from typing import Optional
-from pydantic import Field, field_validator
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -58,21 +57,6 @@ class Settings(BaseSettings):
         default="",
         description="Solana wallet private key (base58 encoded)"
     )
-    
-    @field_validator("wallet_private_key")
-    @classmethod
-    def validate_wallet_key(cls, v: str) -> str:
-        """Validate that wallet private key is provided when not in dry run mode."""
-        # Skip validation in dry run mode
-        if os.getenv("DRY_RUN", "true").lower() == "true":
-            return v
-        
-        if not v or len(v) < 32:
-            raise ValueError(
-                "WALLET_PRIVATE_KEY must be set for production trading. "
-                "Set DRY_RUN=true if you want to test without a real wallet."
-            )
-        return v
     
     # =========================================================================
     # TRADING PARAMETERS
@@ -204,6 +188,19 @@ class Settings(BaseSettings):
         description="Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)"
     )
     
+    @model_validator(mode="after")
+    def validate_wallet_key(self) -> "Settings":
+        """Validate that wallet private key is provided when not in dry run mode.
+        
+        Uses the resolved dry_run value, so DRY_RUN from .env is respected too.
+        """
+        if not self.dry_run and len(self.wallet_private_key) < 32:
+            raise ValueError(
+                "WALLET_PRIVATE_KEY must be set for production trading. "
+                "Set DRY_RUN=true if you want to test without a real wallet."
+            )
+        return self
+    
     # =========================================================================
     # COMPUTED PROPERTIES
     # =========================================================================
@@ -234,7 +231,7 @@ class Settings(BaseSettings):
         if self.is_production:
             errors = []
             
-            if not self.wallet_private_key:
+            if len(self.wallet_private_key) < 32:
                 errors.append("WALLET_PRIVATE_KEY is required for production")
             
             if self.buy_amount_sol > 1.0:
@@ -245,7 +242,7 @@ class Settings(BaseSettings):
             
             if errors:
                 raise ValueError(
-                    f"Production configuration errors:\n" + "\n".join(f"  - {e}" for e in errors)
+                    "Production configuration errors:\n" + "\n".join(f"  - {e}" for e in errors)
                 )
 
 

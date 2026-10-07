@@ -25,10 +25,10 @@ Examples:
 
 import argparse
 import asyncio
+import contextlib
 import logging
 import signal
 import sys
-from typing import Optional
 
 # Configure logging
 def setup_logging(log_level: str = "INFO") -> None:
@@ -67,8 +67,9 @@ def setup_logging(log_level: str = "INFO") -> None:
 
 async def main(args: argparse.Namespace) -> None:
     """Main entry point."""
-    from config.settings import Settings, reload_settings
+    from config.settings import reload_settings
     from bot.sniper import SniperBot
+    from bot.pool_monitor import redact_url
     
     # Reload settings to pick up command-line overrides
     settings = reload_settings()
@@ -77,10 +78,10 @@ async def main(args: argparse.Namespace) -> None:
     if args.dry_run is not None:
         settings.dry_run = args.dry_run
     
-    if args.buy_amount:
+    if args.buy_amount is not None:
         settings.buy_amount_sol = args.buy_amount
     
-    if args.min_liquidity:
+    if args.min_liquidity is not None:
         settings.min_liquidity_sol = args.min_liquidity
     
     if args.log_level:
@@ -105,7 +106,7 @@ async def main(args: argparse.Namespace) -> None:
     # Log configuration summary
     logger.info("Configuration:")
     logger.info(f"  Mode: {'PRODUCTION (REAL TRADES)' if settings.is_production else 'DRY RUN'}")
-    logger.info(f"  RPC URL: {settings.effective_rpc_url[:50]}...")
+    logger.info(f"  RPC URL: {redact_url(settings.effective_rpc_url)}")
     logger.info(f"  Buy Amount: {settings.buy_amount_sol} SOL")
     logger.info(f"  Min Liquidity: {settings.min_liquidity_sol} SOL")
     logger.info(f"  Max Slippage: {settings.max_slippage_bps / 100:.2f}%")
@@ -134,13 +135,17 @@ async def main(args: argparse.Namespace) -> None:
     
     # Setup shutdown handlers
     shutdown_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
     
-    def signal_handler(sig, frame):
-        logger.info(f"\nReceived signal {sig}, shutting down...")
+    def request_shutdown(sig: signal.Signals) -> None:
+        logger.info(f"Received {sig.name}, shutting down...")
         shutdown_event.set()
     
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, request_shutdown, sig)
+        except NotImplementedError:  # Windows
+            signal.signal(sig, lambda s, f: loop.call_soon_threadsafe(shutdown_event.set))
     
     # Start bot
     try:
@@ -148,20 +153,22 @@ async def main(args: argparse.Namespace) -> None:
         
         # Run bot in background task
         bot_task = asyncio.create_task(bot.start())
+        shutdown_task = asyncio.create_task(shutdown_event.wait())
         
-        # Wait for shutdown signal
-        await shutdown_event.wait()
+        # Wait for a shutdown signal, or for the bot to exit on its own (e.g. fatal error)
+        await asyncio.wait({bot_task, shutdown_task}, return_when=asyncio.FIRST_COMPLETED)
+        shutdown_task.cancel()
         
         # Stop bot
         logger.info("Stopping bot...")
         await bot.stop()
         
-        # Cancel bot task
-        bot_task.cancel()
-        try:
-            await bot_task
-        except asyncio.CancelledError:
-            pass
+        if bot_task.done():
+            bot_task.result()  # Re-raise a fatal error from the bot
+        else:
+            bot_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await bot_task
         
         # Print final statistics
         stats = bot.get_stats()
@@ -180,11 +187,20 @@ async def main(args: argparse.Namespace) -> None:
         logger.info(f"  Win Rate: {portfolio['win_rate']:.1f}%")
         logger.info("=" * 60)
         
-    except KeyboardInterrupt:
-        logger.info("Interrupted by user")
     except Exception as e:
         logger.exception(f"Fatal error: {str(e)}")
+        await bot.stop()
         sys.exit(1)
+
+
+def parse_bool(value: str) -> bool:
+    """Parse a strict boolean so a typo can never switch on real trading."""
+    normalized = value.strip().lower()
+    if normalized in ("true", "1", "yes"):
+        return True
+    if normalized in ("false", "0", "no"):
+        return False
+    raise argparse.ArgumentTypeError(f"expected true/false, got '{value}'")
 
 
 def parse_args() -> argparse.Namespace:
@@ -203,7 +219,7 @@ Examples:
     
     parser.add_argument(
         "--dry-run",
-        type=lambda x: x.lower() == 'true',
+        type=parse_bool,
         default=None,
         help="Run in simulation mode (default: True)"
     )

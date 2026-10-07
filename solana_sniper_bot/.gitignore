@@ -35,8 +35,8 @@ ENV/
 
 # Environment Variables (CRITICAL: Never commit these!)
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.example
 
 # Logs
 logs/

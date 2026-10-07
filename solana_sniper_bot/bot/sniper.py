@@ -11,15 +11,16 @@ Orchestrates all components:
 
 import logging
 import asyncio
-from typing import Optional, Dict, Any
-from datetime import datetime
+import time
+from dataclasses import asdict
+from typing import Dict, Any, Set
 
 # Use absolute imports to avoid issues when running as script
 from bot.pool_monitor import PoolMonitor, PoolInfo
-from bot.filters import TokenFilter, FilterResult
+from bot.filters import TokenFilter
 from bot.executor import TradeExecutor
 from bot.risk_manager import RiskManager
-from utils.security import SecurityChecker, TokenSafetyResult
+from utils.security import SecurityChecker
 from config.settings import Settings
 
 logger = logging.getLogger(__name__)
@@ -95,6 +96,11 @@ class SniperBot:
         
         # State
         self._running = False
+        self._start_time = 0.0
+        # Strong references keep background tasks from being garbage-collected
+        self._tasks: Set[asyncio.Task] = set()
+        # Serializes risk check + buy so concurrent pools can't exceed exposure limits
+        self._trade_lock = asyncio.Lock()
         self._stats = {
             "pools_detected": 0,
             "pools_filtered": 0,
@@ -123,6 +129,7 @@ class SniperBot:
                 return
         
         self._running = True
+        self._start_time = time.time()
         
         # Start pool monitoring (this will block)
         await self.pool_monitor.start()
@@ -136,15 +143,36 @@ class SniperBot:
         self._running = False
         
         await self.pool_monitor.stop()
+        
+        for task in list(self._tasks):
+            task.cancel()
+        await asyncio.gather(*self._tasks, return_exceptions=True)
+        
         await self.executor.close()
         
         logger.info("SniperBot stopped")
+    
+    def _spawn(self, coro) -> None:
+        """Run a coroutine in the background and keep a reference to it."""
+        task = asyncio.create_task(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
     
     async def _on_new_pool(self, pool_info: PoolInfo) -> None:
         """
         Callback when a new pool is detected.
         
-        This is the main entry point for the sniping workflow.
+        Hands the pool off to a background task so the WebSocket
+        listener is not blocked while the pool is analyzed.
+        
+        Args:
+            pool_info: Information about the new pool
+        """
+        self._spawn(self._process_pool(pool_info))
+    
+    async def _process_pool(self, pool_info: PoolInfo) -> None:
+        """
+        Main sniping workflow for a single pool.
         
         Args:
             pool_info: Information about the new pool
@@ -152,16 +180,18 @@ class SniperBot:
         self._stats["pools_detected"] += 1
         
         logger.info(
-            f"🔍 Analyzing new pool: {pool_info.token_address[:8]}... | "
+            f"🔍 Analyzing new pool: TX {pool_info.signature[:16]}... | "
             f"DEX: {pool_info.dex} | Liquidity: {pool_info.liquidity_sol:.2f} SOL"
         )
         
         try:
+            pool_dict = asdict(pool_info)
+            
             # Step 1: Fast filtering
             filter_result = await self.token_filter.filter_token(
                 token_address=pool_info.token_address,
                 pool_address=pool_info.pool_address,
-                pool_info=self._pool_info_to_dict(pool_info),
+                pool_info=pool_dict,
             )
             
             if not filter_result.passed:
@@ -174,7 +204,7 @@ class SniperBot:
             # Step 2: Deep security analysis
             safety_result = await self.security_checker.analyze_token(
                 token_address=pool_info.token_address,
-                pool_info=self._pool_info_to_dict(pool_info),
+                pool_info=pool_dict,
                 token_metadata=pool_info.token_metadata,
             )
             
@@ -189,54 +219,64 @@ class SniperBot:
             self._stats["security_checks_passed"] += 1
             logger.info(f"✅ Security check passed: {safety_result.get_summary()}")
             
-            # Step 3: Risk management check
-            can_trade, reason = self.risk_manager.can_open_position(
-                self.settings.buy_amount_sol
-            )
-            
-            if not can_trade:
-                logger.warning(f"⛔ Risk manager blocked trade: {reason}")
-                return
-            
-            # Step 4: Execute buy
-            self._stats["trades_executed"] += 1
-            
-            buy_result = await self.executor.execute_buy(
-                pool_address=pool_info.pool_address,
-                token_address=pool_info.token_address,
-                sol_amount=self.settings.buy_amount_sol,
-                min_tokens_out=self._calculate_min_tokens_out(pool_info),
-            )
-            
-            if buy_result.success:
-                self._stats["trades_successful"] += 1
-                
-                logger.info(
-                    f"✅ BUY EXECUTED! TX: {buy_result.transaction_signature}"
-                )
-                
-                # Open position in risk manager
-                entry_price = self._calculate_entry_price(pool_info)
-                self.risk_manager.open_position(
-                    token_address=pool_info.token_address,
-                    pool_address=pool_info.pool_address,
-                    entry_price=entry_price,
-                    amount_tokens=buy_result.token_amount,
-                    amount_sol=buy_result.sol_amount,
-                )
-                
-                # Start monitoring position if auto-sell enabled
-                if self.settings.enable_auto_sell:
-                    asyncio.create_task(
-                        self._monitor_position(pool_info.token_address)
-                    )
-                
-            else:
-                self._stats["trades_failed"] += 1
-                logger.error(f"❌ Trade execution failed: {buy_result.error_message}")
+            # Steps 3-4 run under a lock: risk check, buy and position bookkeeping
+            # must be atomic, or two pools could both pass the exposure check.
+            async with self._trade_lock:
+                await self._execute_trade(pool_info)
                 
         except Exception as e:
             logger.exception(f"Error processing pool: {str(e)}")
+    
+    async def _execute_trade(self, pool_info: PoolInfo) -> None:
+        """Check risk limits, buy, and open the position."""
+        # Step 3: Risk management check
+        can_trade, reason = self.risk_manager.can_open_position(
+            self.settings.buy_amount_sol
+        )
+        
+        if not can_trade:
+            logger.warning(f"⛔ Risk manager blocked trade: {reason}")
+            return
+        
+        min_tokens_out = self._calculate_min_tokens_out(pool_info)
+        if min_tokens_out <= 0:
+            logger.warning("⛔ Pool reserves unknown - refusing to buy without slippage protection")
+            return
+
+        # Step 4: Execute buy
+        self._stats["trades_executed"] += 1
+
+        buy_result = await self.executor.execute_buy(
+            pool_address=pool_info.pool_address,
+            token_address=pool_info.token_address,
+            sol_amount=self.settings.buy_amount_sol,
+            min_tokens_out=min_tokens_out,
+        )
+        
+        if buy_result.success:
+            self._stats["trades_successful"] += 1
+            
+            logger.info(
+                f"✅ BUY EXECUTED! TX: {buy_result.transaction_signature}"
+            )
+            
+            # Open position in risk manager
+            entry_price = self._calculate_entry_price(pool_info)
+            self.risk_manager.open_position(
+                token_address=pool_info.token_address,
+                pool_address=pool_info.pool_address,
+                entry_price=entry_price,
+                amount_tokens=buy_result.token_amount,
+                amount_sol=buy_result.sol_amount,
+            )
+            
+            # Start monitoring position if auto-sell enabled
+            if self.settings.enable_auto_sell:
+                self._spawn(self._monitor_position(pool_info.token_address))
+
+        else:
+            self._stats["trades_failed"] += 1
+            logger.error(f"❌ Trade execution failed: {buy_result.error_message}")
     
     async def _monitor_position(self, token_address: str) -> None:
         """
@@ -265,11 +305,14 @@ class SniperBot:
                         # Execute sell
                         position = self.risk_manager.positions.get(token_address)
                         if position:
+                            # Slippage is applied to the current value, not the entry value:
+                            # a stop-loss sell demanding 90% of the entry could never fill.
+                            slippage_factor = 1 - (self.settings.max_slippage_bps / 10000)
                             sell_result = await self.executor.execute_sell(
                                 pool_address=position.pool_address,
                                 token_address=token_address,
                                 token_amount=position.amount_tokens,
-                                min_sol_out=position.amount_sol_invested * 0.9,  # 90% of entry
+                                min_sol_out=position.amount_tokens * current_price * slippage_factor,
                             )
                             
                             if sell_result.success:
@@ -301,24 +344,12 @@ class SniperBot:
         # Placeholder - implement with actual price fetching
         return 0.0
     
-    def _pool_info_to_dict(self, pool_info: PoolInfo) -> Dict[str, Any]:
-        """Convert PoolInfo to dictionary for other components."""
-        return {
-            "pool_address": pool_info.pool_address,
-            "token_address": pool_info.token_address,
-            "liquidity_sol": pool_info.liquidity_sol,
-            "creation_timestamp": pool_info.creation_timestamp,
-            "dex": pool_info.dex,
-            "program_id": pool_info.program_id,
-            "token_metadata": pool_info.token_metadata,
-            "creator_address": pool_info.creator_address,
-            "initial_liquidity_sol": pool_info.initial_liquidity_sol,
-        }
-    
     def _calculate_min_tokens_out(self, pool_info: PoolInfo) -> float:
         """Calculate minimum tokens to receive based on slippage."""
         # Simplified calculation
         # In production: use actual pool reserves and swap formula
+        if pool_info.liquidity_sol <= 0:
+            return 0.0
         base_amount = pool_info.liquidity_tokens / pool_info.liquidity_sol
         slippage_factor = 1 - (self.settings.max_slippage_bps / 10000)
         return base_amount * self.settings.buy_amount_sol * slippage_factor
@@ -338,8 +369,5 @@ class SniperBot:
             "running": self._running,
             "mode": "production" if self.settings.is_production else "dry_run",
             "portfolio": portfolio,
-            "uptime_seconds": (
-                datetime.now().timestamp() - self._start_time
-                if hasattr(self, "_start_time") else 0
-            ),
+            "uptime_seconds": time.time() - self._start_time if self._start_time else 0,
         }

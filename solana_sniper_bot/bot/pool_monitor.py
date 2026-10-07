@@ -7,10 +7,44 @@ using WebSocket subscriptions for real-time detection.
 
 import logging
 import asyncio
+import time
 from typing import Dict, Any, Optional, Callable, List
 from dataclasses import dataclass
+from urllib.parse import urlsplit
+
+from solana.rpc.websocket_api import connect
+from solders.pubkey import Pubkey
+from solders.rpc.config import RpcTransactionLogsFilterMentions
+from solders.rpc.responses import LogsNotification, SubscriptionResult
+from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 logger = logging.getLogger(__name__)
+
+# Known DEX program IDs on mainnet
+RAYDIUM_AMM_V4 = Pubkey.from_string("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8")
+ORCA_WHIRLPOOL = Pubkey.from_string("whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc")
+PUMPFUN_MAIN = Pubkey.from_string("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P")
+
+# Log lines emitted by each program when a new pool / token is created
+POOL_CREATION_MARKERS = {
+    "raydium": ("initialize2",),
+    "orca": ("Instruction: InitializePool",),
+    "pumpfun": ("Instruction: Create",),
+}
+
+
+def _is_transient(error: Exception) -> bool:
+    """Network drops, rate limits and server errors are retried; config errors (401/403) are not."""
+    if isinstance(error, InvalidStatus):
+        status = error.response.status_code
+        return status == 429 or status >= 500
+    return isinstance(error, (ConnectionClosed, OSError, asyncio.TimeoutError))
+
+
+def redact_url(url: str) -> str:
+    """Strip path and query (which often carry API keys) from an RPC URL for logging."""
+    parts = urlsplit(url)
+    return f"{parts.scheme}://{parts.hostname or ''}"
 
 
 @dataclass
@@ -33,6 +67,7 @@ class PoolInfo:
     token_metadata: Dict[str, Any] = None
     
     # Additional data
+    signature: str = ""
     creator_address: Optional[str] = None
     initial_liquidity_sol: Optional[float] = None
     
@@ -50,16 +85,12 @@ class PoolMonitor:
     - Orca Whirlpool
     - Pump.fun
     
-    Uses WebSocket subscriptions for instant detection.
+    Uses WebSocket log subscriptions for instant detection and
+    reconnects automatically when the connection drops.
     """
     
-    # Known DEX program IDs on mainnet
-    RAYDIUM_AMM_V4 = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
-    ORCA_WHIRLPOOL = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
-    PUMPFUN_MAIN = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
-    
-    # SPL Token Program
-    TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+    RECONNECT_BASE_DELAY = 1.0
+    RECONNECT_MAX_DELAY = 30.0
     
     def __init__(
         self,
@@ -81,16 +112,22 @@ class PoolMonitor:
         """
         self.ws_url = ws_url
         self.rpc_url = rpc_url
-        self.monitor_raydium = monitor_raydium
-        self.monitor_orca = monitor_orca
-        self.monitor_pumpfun = monitor_pumpfun
+        
+        self._programs: Dict[str, Pubkey] = {}
+        if monitor_raydium:
+            self._programs["raydium"] = RAYDIUM_AMM_V4
+        if monitor_orca:
+            self._programs["orca"] = ORCA_WHIRLPOOL
+        if monitor_pumpfun:
+            self._programs["pumpfun"] = PUMPFUN_MAIN
         
         # Callbacks for new pools
         self._pool_callbacks: List[Callable] = []
         
         # Connection state
         self._ws_connection = None
-        self._subscriptions: Dict[str, int] = {}
+        self._pending_requests: Dict[int, str] = {}  # request id -> dex
+        self._subscriptions: Dict[int, str] = {}  # server subscription id -> dex
         self._running = False
         
         # Statistics
@@ -110,44 +147,40 @@ class PoolMonitor:
         logger.info(f"Added pool callback. Total callbacks: {len(self._pool_callbacks)}")
     
     async def start(self) -> None:
-        """Start monitoring for new pools."""
+        """Start monitoring for new pools. Runs until stop() is called."""
         if self._running:
             logger.warning("PoolMonitor already running")
             return
+        if not self._programs:
+            raise ValueError("No DEX enabled - enable at least one of MONITOR_RAYDIUM/ORCA/PUMPFUN")
         
         self._running = True
         logger.info("Starting PoolMonitor...")
         
+        delay = self.RECONNECT_BASE_DELAY
         try:
-            # Connect to WebSocket
-            await self._connect_websocket()
-            
-            # Subscribe to DEX programs
-            if self.monitor_raydium:
-                await self._subscribe_to_program(
-                    self.RAYDIUM_AMM_V4,
-                    "raydium",
-                )
-            
-            if self.monitor_orca:
-                await self._subscribe_to_program(
-                    self.ORCA_WHIRLPOOL,
-                    "orca",
-                )
-            
-            if self.monitor_pumpfun:
-                await self._subscribe_to_program(
-                    self.PUMPFUN_MAIN,
-                    "pumpfun",
-                )
-            
-            # Start listening for events
-            await self._listen_for_events()
-            
-        except Exception as e:
-            logger.error(f"PoolMonitor error: {str(e)}")
+            while self._running:
+                try:
+                    logger.info(f"Connecting to WebSocket: {redact_url(self.ws_url)}")
+                    async with connect(self.ws_url) as ws:
+                        self._ws_connection = ws
+                        await self._subscribe_all()
+                        delay = self.RECONNECT_BASE_DELAY
+                        await self._listen_for_events()
+                except Exception as e:
+                    if not self._running:
+                        break
+                    if not _is_transient(e):
+                        raise
+                    logger.warning(f"WebSocket connection lost ({e}); reconnecting in {delay:.0f}s")
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, self.RECONNECT_MAX_DELAY)
+                finally:
+                    self._ws_connection = None
+                    self._pending_requests.clear()
+                    self._subscriptions.clear()
+        finally:
             self._running = False
-            raise
     
     async def stop(self) -> None:
         """Stop monitoring."""
@@ -155,163 +188,105 @@ class PoolMonitor:
         
         if self._ws_connection:
             await self._ws_connection.close()
-            self._ws_connection = None
         
         logger.info("PoolMonitor stopped")
     
-    async def _connect_websocket(self) -> None:
-        """Establish WebSocket connection."""
-        from solana.rpc.websocket_api import connect
-        
-        logger.info(f"Connecting to WebSocket: {self.ws_url[:30]}...")
-        
-        self._ws_connection = await connect(self.ws_url).__aenter__()
-        
-        logger.info("WebSocket connected")
-    
-    async def _subscribe_to_program(
-        self,
-        program_id: str,
-        dex_name: str,
-    ) -> None:
-        """
-        Subscribe to logs for a DEX program.
-        
-        Args:
-            program_id: Program public key (as string)
-            dex_name: Name of the DEX
-        """
-        from solders.pubkey import Pubkey
-        
-        logger.info(f"Subscribing to {dex_name} program: {program_id}")
-        
-        try:
-            # Convert string to Pubkey object
-            program_pubkey = Pubkey.from_string(program_id)
-            
-            # Subscribe to program logs
-            subscription = await self._ws_connection.program_subscribe(
-                program_pubkey,
+    async def _subscribe_all(self) -> None:
+        """Subscribe to the logs of every enabled DEX program."""
+        for dex_name, program_id in self._programs.items():
+            logger.info(f"Subscribing to {dex_name} program: {program_id}")
+            request_id = await self._ws_connection.logs_subscribe(
+                RpcTransactionLogsFilterMentions(program_id),
                 commitment="confirmed",
             )
-            
-            self._subscriptions[dex_name] = subscription
-            
-            logger.info(f"Subscribed to {dex_name} (subscription ID: {subscription})")
-            
-        except Exception as e:
-            logger.error(f"Failed to subscribe to {dex_name}: {str(e)}")
+            self._pending_requests[request_id] = dex_name
     
     async def _listen_for_events(self) -> None:
-        """Listen for log events from subscribed programs."""
+        """Listen for log events until the connection closes or the monitor stops."""
         logger.info("Listening for pool creation events...")
         
         while self._running:
-            try:
-                # Wait for message with timeout
-                message = await asyncio.wait_for(
-                    self._ws_connection.recv(),
-                    timeout=30.0,
-                )
-                
-                # Process the message
-                await self._process_log_message(message)
-                
-            except asyncio.TimeoutError:
-                # Send ping to keep connection alive
-                continue
-            except Exception as e:
-                error_msg = str(e)
-                # Ignore WebSocket close frame errors (normal behavior)
-                if "sent 1000" in error_msg and "received 1000" in error_msg:
-                    logger.debug(f"WebsSocket keepalive: {error_msg}")
-                else:
-                    logger.error(f"Error processing message: {error_msg}")
-                await asyncio.sleep(0.5)
+            # recv() raises ConnectionClosed when the socket dies, which start() turns into a reconnect
+            messages = await self._ws_connection.recv()
+            for message in messages:
+                try:
+                    await self._process_message(message)
+                except Exception:
+                    logger.exception("Error processing WebSocket message")
     
-    async def _process_log_message(self, message: Any) -> None:
+    async def _process_message(self, message: Any) -> None:
         """
-        Process a WebSocket log message.
+        Process a parsed WebSocket message.
         
         Args:
-            message: Raw WebSocket message
+            message: SubscriptionResult or LogsNotification from solana-py
         """
-        try:
-            # Parse message structure
-            # Format depends on Solana WS API
-            if not hasattr(message, '__getitem__'):
-                return
-            
-            # Extract log data
-            params = message[0] if len(message) > 0 else None
-            if not params or 'value' not in params:
-                return
-            
-            value = params['value']
-            logs = value.get('logs', [])
-            signature = value.get('signature', '')
-            
-            # Check if this is a pool creation event
-            pool_info = await self._parse_pool_creation(logs, signature)
-            
-            if pool_info:
-                self.pools_detected += 1
-                self.last_pool_time = asyncio.get_event_loop().time()
-                
-                logger.info(
-                    f"🆕 New pool detected on {pool_info.dex}! | "
-                    f"Token: {pool_info.token_address[:8]}... | "
-                    f"Liquidity: {pool_info.liquidity_sol:.2f} SOL"
-                )
-                
-                # Notify callbacks
-                await self._notify_callbacks(pool_info)
-                
-        except Exception as e:
-            logger.debug(f"Error parsing log message: {str(e)}")
+        if isinstance(message, SubscriptionResult):
+            dex_name = self._pending_requests.pop(message.id, None)
+            if dex_name is not None:
+                self._subscriptions[message.result] = dex_name
+                logger.info(f"Subscribed to {dex_name} (subscription ID: {message.result})")
+            return
+        
+        if not isinstance(message, LogsNotification):
+            return
+        
+        dex_name = self._subscriptions.get(message.subscription)
+        value = message.result.value
+        if dex_name is None or value.err is not None:
+            # Unknown subscription or failed transaction
+            return
+        
+        pool_info = self._parse_pool_creation(dex_name, value.logs, str(value.signature))
+        if pool_info is None:
+            return
+        
+        self.pools_detected += 1
+        self.last_pool_time = time.time()
+        
+        logger.info(
+            f"🆕 New pool detected on {pool_info.dex}! | TX: {pool_info.signature[:16]}..."
+        )
+        
+        await self._notify_callbacks(pool_info)
     
-    async def _parse_pool_creation(
+    def _parse_pool_creation(
         self,
+        dex_name: str,
         logs: List[str],
         signature: str,
     ) -> Optional[PoolInfo]:
         """
         Parse logs to detect pool creation.
         
-        This is a simplified implementation. In production, you would:
-        1. Parse actual log messages from each DEX
-        2. Extract pool state from account data
-        3. Fetch token metadata
+        Detection only looks at the program's log markers. Pool/token addresses
+        and reserves are not part of the logs; in production, fetch the
+        transaction (getTransaction) and read them from its accounts.
         
         Args:
+            dex_name: DEX the subscription belongs to
             logs: Transaction log messages
             signature: Transaction signature
             
         Returns:
             PoolInfo if pool creation detected, None otherwise
         """
-        # Simplified detection logic
-        # In production, implement proper log parsing for each DEX
+        markers = POOL_CREATION_MARKERS[dex_name]
+        if not any(marker in log for log in logs for marker in markers):
+            return None
         
-        # Look for initialization patterns
-        for log in logs:
-            if 'initialize' in log.lower() or 'init' in log.lower():
-                # Found potential pool initialization
-                # Extract addresses from logs (simplified)
-                
-                return PoolInfo(
-                    pool_address=f"pool_{signature[:40]}",
-                    token_address=f"token_{signature[:40]}",
-                    base_mint="So11111111111111111111111111111111111111112",  # Wrapped SOL
-                    quote_mint=f"token_{signature[:40]}",
-                    liquidity_sol=1000.0,  # Placeholder
-                    liquidity_tokens=1000000.0,  # Placeholder
-                    creation_timestamp=asyncio.get_event_loop().time(),
-                    dex="raydium",  # Would be determined from program ID
-                    program_id=self.RAYDIUM_AMM_V4,
-                )
-        
-        return None
+        return PoolInfo(
+            pool_address="",  # Unresolved - requires getTransaction
+            token_address="",  # Unresolved - requires getTransaction
+            base_mint="So11111111111111111111111111111111111111112",  # Wrapped SOL
+            quote_mint="",
+            liquidity_sol=0.0,  # Unknown until reserves are fetched
+            liquidity_tokens=0.0,
+            creation_timestamp=time.time(),
+            dex=dex_name,
+            program_id=str(self._programs[dex_name]),
+            signature=signature,
+        )
     
     async def _notify_callbacks(self, pool_info: PoolInfo) -> None:
         """Notify all registered callbacks about a new pool."""
@@ -330,9 +305,9 @@ class PoolMonitor:
             "running": self._running,
             "pools_detected": self.pools_detected,
             "active_subscriptions": len(self._subscriptions),
-            "subscribed_dexes": list(self._subscriptions.keys()),
+            "subscribed_dexes": sorted(set(self._subscriptions.values())),
             "last_pool_detected_ago": (
-                asyncio.get_event_loop().time() - self.last_pool_time
+                time.time() - self.last_pool_time
                 if self.last_pool_time > 0 else None
             ),
         }

@@ -5,8 +5,9 @@ Handles the creation and submission of swap transactions
 with optimized priority fees and MEV protection.
 """
 
+import asyncio
 import logging
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Any
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
@@ -92,10 +93,8 @@ class TradeExecutor:
         """Get or create wallet keypair."""
         if self._wallet is None:
             from solders.keypair import Keypair
-            import base58
             
-            key_bytes = base58.b58decode(self.wallet_private_key)
-            self._wallet = Keypair.from_bytes(key_bytes)
+            self._wallet = Keypair.from_base58_string(self.wallet_private_key)
         return self._wallet
     
     async def execute_buy(
@@ -229,12 +228,9 @@ class TradeExecutor:
         is_buy: bool,
     ) -> Any:
         """
-        Build a swap transaction for Raydium/Orca with optimized compute units.
+        Build a swap transaction for Raydium/Orca.
         
-        This implementation includes:
-        1. Compute budget optimization for faster execution
-        2. Dynamic slippage adjustment based on volatility
-        3. MEV-protected transaction structure
+        Not implemented yet: always raises NotImplementedError.
         
         Args:
             pool_address: Liquidity pool address
@@ -246,52 +242,17 @@ class TradeExecutor:
         Returns:
             VersionedTransaction ready for signing
         """
-        from solders.transaction import VersionedTransaction
-        from solders.message import MessageV0
-        from solders.instruction import Instruction, AccountMeta
-        from solders.pubkey import Pubkey
-        import time
-        
-        logger.debug(f"Building {'buy' if is_buy else 'sell'} TX for pool {pool_address[:8]}...")
-        
-        try:
-            # Convert addresses to Pubkey objects
-            pool_pubkey = Pubkey.from_string(pool_address) if len(pool_address) == 44 else Pubkey.new_unique()
-            token_pubkey = Pubkey.from_string(token_address) if len(token_address) == 44 else Pubkey.new_unique()
-            
-            # In production, integrate with actual DEX SDKs:
-            # - Raydium: https://github.com/raydium-io/raydium-sdk
-            # - Orca: https://github.com/orca-so/whirlpool
-            # - Jupiter Aggregator: https://docs.jup.ag/docs/jupiter-aggregator-api
-            
-            # Placeholder: Create optimized transaction structure
-            # For production, replace with actual DEX instruction building
-            
-            # Example structure for Raydium swap (simplified):
-            # accounts = [
-            #     AccountMeta(pubkey=self.wallet.pubkey(), is_signer=True, is_writable=True),
-            #     AccountMeta(pubkey=pool_pubkey, is_signer=False, is_writable=True),
-            #     AccountMeta(pubkey=token_pubkey, is_signer=False, is_writable=True),
-            #     ... additional required accounts ...
-            # ]
-            # 
-            # swap_instruction = Instruction(
-            #     program_id=Pubkey.from_string(self.RAYDIUM_PROGRAM_ID),
-            #     accounts=accounts,
-            #     data=bytes([...])  # Swap instruction data
-            # )
-            
-            # For now, return a minimal valid transaction structure
-            # This will be replaced by actual DEX integration in production
-            
-            logger.info(f"Transaction built successfully for {'buy' if is_buy else 'sell'} operation")
-            
-            # Return None as placeholder - actual implementation requires DEX SDK integration
-            return None
-            
-        except Exception as e:
-            logger.error(f"Failed to build swap transaction: {str(e)}")
-            raise
+        # In production, integrate with actual DEX SDKs / aggregators:
+        # - Raydium: https://github.com/raydium-io/raydium-sdk
+        # - Orca: https://github.com/orca-so/whirlpool
+        # - Jupiter Aggregator: https://docs.jup.ag/docs/jupiter-aggregator-api
+        #
+        # Fail loudly instead of handing an empty transaction to the RPC node.
+        raise NotImplementedError(
+            f"Swap transaction building is not implemented yet "
+            f"({'buy' if is_buy else 'sell'} on pool {pool_address[:8]}...). "
+            "Live trading is unavailable; run with DRY_RUN=true."
+        )
     
     async def _submit_transaction(
         self,
